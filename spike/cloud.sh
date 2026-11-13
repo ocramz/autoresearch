@@ -19,7 +19,7 @@ BUCKET=${BUCKET:-autoresearch-$PROJECT}
 REGION=${REGION:-europe-west4}                          # one of the regions with the GPU
 REPOSITORY=${REPOSITORY:-autoresearch-europe-west4}     # the user's, in REGION
 JOB=ar-spike-17a
-TAG=$(cat pyproject.toml uv.lock .python-version prepare.py train.py spike/Containerfile spike/*.py spike/*.sh | shasum -a 256 | cut -c1-16)
+TAG=$(cat pyproject.toml uv.lock .python-version prepare.py train.py spike/Containerfile spike/*.py spike/diagnose.sh spike/smoke.sh | shasum -a 256 | cut -c1-16)
 IMAGE=$REGION-docker.pkg.dev/$PROJECT/$REPOSITORY/spike-17a:$TAG
 
 logs() {
@@ -62,6 +62,27 @@ run)
     done
     grep -E '^(SPIKE_|train .*: exit|full_eval|=== )' "spike/results/$execution.log" || true
     grep -E 'message' "spike/results/$execution.conditions.yaml" || true
+    ;;
+probe)
+    # Plan 17b's probe: spike/probe.sh on the newest image in the repository, passed as an argument
+    # (base64, which has no comma for gcloud's lists), so that no build is needed.
+    newest=$(gcloud artifacts docker images list "$REGION-docker.pkg.dev/$PROJECT/$REPOSITORY/spike-17a" \
+        --project "$PROJECT" --sort-by ~CREATE_TIME --limit 1 --format 'value(version)')
+    [ -n "$newest" ] || { echo "probe: no image in $REPOSITORY; run spike/cloud.sh build"; exit 2; }
+    JOB=ar-spike-17b-probe
+    gcloud run jobs deploy "$JOB" --project "$PROJECT" --region "$REGION" \
+        --image "$REGION-docker.pkg.dev/$PROJECT/$REPOSITORY/spike-17a@$newest" \
+        --command bash --args="-c,echo $(base64 < spike/probe.sh | tr -d '\n') | base64 -d | bash" \
+        --gpu 1 --gpu-type nvidia-rtx-pro-6000 --no-gpu-zonal-redundancy --cpu 20 --memory 80Gi \
+        --tasks 1 --max-retries 0 --task-timeout 15m \
+        --service-account "ar-job@$PROJECT.iam.gserviceaccount.com"
+    gcloud run jobs execute "$JOB" --project "$PROJECT" --region "$REGION" --wait || echo "the execution failed: $?"
+    execution=$(gcloud run jobs executions list --project "$PROJECT" --region "$REGION" --job "$JOB" --limit 1 --format 'value(metadata.name)')
+    for _ in 1 2 3 4 5 6; do
+        logs "$execution"
+        grep -q '^=== done' "spike/results/$execution.log" && break
+        sleep 20
+    done
     ;;
 logs)
     logs "$2"
