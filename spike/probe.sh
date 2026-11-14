@@ -32,10 +32,74 @@ cat /proc/net/unix | awk 'NR == 1 || $8 ~ /^@/'
 
 stage world-writable
 find / \( -path /proc -o -path /sys \) -prune -o -type d -perm -0002 -print 2>/dev/null
-find / \( -path /proc -o -path /sys \) -prune -o -user 65534 -print 2>/dev/null | head -50
 
 stage limits
 ulimit -a
+
+# The wrapper's invariant scan (wrapper/src/scan.rs), as `find` sees it: outside /proc, /sys and the
+# sandbox uids' places, what each uid can write (access(2)) or owns, as a directory, file or fifo. An
+# owned entry on a read-only mount is left out: the scan will count it as unwritable.
+scan_view() {
+    ro=$(awk '$6 ~ /(^|,)ro(,|$)/ { printf "%s ", $5 }' /proc/self/mountinfo)
+    for uid in 65534 65533; do
+        echo "--- writable by $uid"
+        setpriv --reuid=$uid --regid=$uid --clear-groups --inh-caps=-all --bounding-set=-all --no-new-privs \
+            find / \( -path /proc -o -path /sys \) -prune -o \( -type d -o -type f -o -type p \) -writable -print 2>/dev/null
+        echo "--- owned by $uid, on a mount that isn't read-only"
+        find / \( -path /proc -o -path /sys \) -prune -o \( -type d -o -type f -o -type p \) -user $uid -print 2>/dev/null |
+            awk -v ro="$ro" 'BEGIN { n = split(ro, p, " ") } { for (i = 1; i <= n; i++) if (p[i] != "" && ($0 == p[i] || index($0, p[i] "/") == 1)) next; print }'
+    done | grep -vE '^/(tmp|var/tmp|dev/shm|dev/mqueue|run/lock|var/log/journal|work)(/|$)'
+}
+
+stage scan-before
+scan_view
+
+# The fixes as the wrapper makes them: /dev, /dev/log and /var/log as before (plan 10d), then each
+# read-write mount of the GPU runtime remounted read-only with the syscall and flags the wrapper uses,
+# and /usr/local/nvidia, which chown is refused (the first probe), bound onto itself with what is
+# mounted below it, and that bind made read-only.
+stage driver-dir
+lsattr -d /usr/local/nvidia 2>&1 || true
+stat -c '%n %U(%u) %a' /usr/local/nvidia
+touch /usr/local/nvidia/probe-file 2>&1 && { echo "root can create in /usr/local/nvidia"; rm -f /usr/local/nvidia/probe-file; }
+
+stage fix
+chmod 0755 /dev && echo "/dev 0755"
+rm -f /dev/log && echo "/dev/log removed"
+mount -t tmpfs -o mode=0755,uid=0,gid=0,size=1m,nosuid,nodev,noexec none /var/log && echo "/var/log covered"
+python - <<'EOF'
+import ctypes, os
+FLAGS = {"nosuid": 2, "nodev": 4, "noexec": 8, "noatime": 1024, "nodiratime": 2048, "relatime": 1 << 21}
+MS_RDONLY, MS_REMOUNT, MS_BIND, MS_REC = 1, 32, 4096, 16384
+DRIVER = "/usr/local/nvidia"
+libc = ctypes.CDLL(None, use_errno=True)
+
+def mounts():
+    return [(f[4], f[5].split(",")) for f in map(str.split, open("/proc/self/mountinfo"))]
+
+def kept(options):
+    return sum(v for k, v in FLAGS.items() if k in options)
+
+def call(label, source, point, flags):
+    r = libc.mount(source, point.encode(), None, flags, None)
+    print(label, point, "->", "ok" if r == 0 else os.strerror(ctypes.get_errno()), flush=True)
+
+for point, options in mounts():
+    if point == "/dev/nvidia-caps" or point == DRIVER or point.startswith(DRIVER + "/"):
+        if "rw" in options:
+            call("remount read-only:", None, point, MS_REMOUNT | MS_BIND | MS_RDONLY | kept(options))
+        else:
+            print("already read-only:", point, options, flush=True)
+if os.path.isdir(DRIVER) and not any(point == DRIVER for point, _ in mounts()):
+    on = max((m for m in mounts() if DRIVER == m[0] or DRIVER.startswith(m[0].rstrip("/") + "/")), key=lambda m: len(m[0]))
+    print("the driver directory is on", on, flush=True)
+    call("bind onto itself:", DRIVER.encode(), DRIVER, MS_BIND | MS_REC)
+    call("remount read-only:", None, DRIVER, MS_REMOUNT | MS_BIND | MS_RDONLY | kept(on[1]))
+EOF
+ls /usr/local/nvidia/lib64 | wc -l
+
+stage scan-after
+scan_view
 
 stage cuda-as-65534
 home=$(mktemp -d /tmp/probe-home.XXXXXX)
